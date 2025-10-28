@@ -1,26 +1,39 @@
 """ Full assembly of the parts to form the complete network """
 
+import torch
 from .unet_parts import *
 
 
 class UNet(nn.Module):
-    def __init__(self, n_channels, n_classes, bilinear=False):
+    def __init__(self, n_channels, n_classes, bilinear=False, base_c: int = 16):
+        """
+        UNet with configurable base channels (base_c).
+        Smaller base_c -> much faster and lower memory usage, at cost of accuracy.
+        Default base_c=16 is aggressive for fast runs on consumer GPUs.
+        """
         super(UNet, self).__init__()
         self.n_channels = n_channels
         self.n_classes = n_classes
         self.bilinear = bilinear
+        self.base_c = base_c
 
-        self.inc = (DoubleConv(n_channels, 64))
-        self.down1 = (Down(64, 128))
-        self.down2 = (Down(128, 256))
-        self.down3 = (Down(256, 512))
+        # compute channel widths from base
+        c1 = base_c
+        c2 = base_c * 2
+        c3 = base_c * 4
+        c4 = base_c * 8
         factor = 2 if bilinear else 1
-        self.down4 = (Down(512, 1024 // factor))
-        self.up1 = (Up(1024, 512 // factor, bilinear))
-        self.up2 = (Up(512, 256 // factor, bilinear))
-        self.up3 = (Up(256, 128 // factor, bilinear))
-        self.up4 = (Up(128, 64, bilinear))
-        self.outc = (OutConv(64, n_classes))
+
+        self.inc = (DoubleConv(n_channels, c1))
+        self.down1 = (Down(c1, c2))
+        self.down2 = (Down(c2, c3))
+        self.down3 = (Down(c3, c4))
+        self.down4 = (Down(c4, c4 * 2 // factor))
+        self.up1 = (Up(c4 * 2, c4 // factor, bilinear))
+        self.up2 = (Up(c4, c3 // factor, bilinear))
+        self.up3 = (Up(c3, c2 // factor, bilinear))
+        self.up4 = (Up(c2, c1, bilinear))
+        self.outc = (OutConv(c1, n_classes))
 
     def forward(self, x):
         x1 = self.inc(x)

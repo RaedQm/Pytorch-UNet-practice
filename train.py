@@ -10,7 +10,7 @@ import torchvision.transforms as transforms
 import torchvision.transforms.functional as TF
 from pathlib import Path
 from torch import optim
-from torch.utils.data import DataLoader, random_split
+from torch.utils.data import DataLoader, random_split, Subset
 from tqdm import tqdm
 
 import wandb
@@ -37,6 +37,8 @@ def train_model(
         weight_decay: float = 1e-8,
         momentum: float = 0.999,
         gradient_clipping: float = 1.0,
+    subset: float = 1.0,
+    gray: bool = False,
 ):
     # 1. Create dataset
     try:
@@ -44,13 +46,40 @@ def train_model(
     except (AssertionError, RuntimeError, IndexError):
         dataset = BasicDataset(dir_img, dir_mask, img_scale)
 
+    # Optionally reduce dataset size (fast experiments)
+    if subset is not None and 0 < subset < 1.0:
+        keep = max(1, int(len(dataset) * subset))
+        indices = list(range(len(dataset)))
+        random.Random(0).shuffle(indices)
+        indices = indices[:keep]
+        dataset = Subset(dataset, indices)
+
+    # Optionally convert dataset outputs to grayscale (single channel)
+    if gray:
+        class GrayWrapper(torch.utils.data.Dataset):
+            def __init__(self, ds):
+                self.ds = ds
+            def __len__(self):
+                return len(self.ds)
+            def __getitem__(self, idx):
+                item = self.ds[idx]
+                img = item['image']
+                # If image has 3 channels, average to produce 1 channel
+                if img.ndim == 3 and img.shape[0] == 3:
+                    img = img.mean(dim=0, keepdim=True)
+                item['image'] = img
+                return item
+
+        dataset = GrayWrapper(dataset)
+
     # 2. Split into train / validation partitions
     n_val = int(len(dataset) * val_percent)
     n_train = len(dataset) - n_val
     train_set, val_set = random_split(dataset, [n_train, n_val], generator=torch.Generator().manual_seed(0))
 
     # 3. Create data loaders
-    loader_args = dict(batch_size=batch_size, num_workers=os.cpu_count(), pin_memory=True)
+    # Limit num_workers to a reasonable default to reduce overhead on Windows/WSL
+    loader_args = dict(batch_size=batch_size, num_workers=min(4, os.cpu_count()), pin_memory=True)
     train_loader = DataLoader(train_set, shuffle=True, **loader_args)
     val_loader = DataLoader(val_set, shuffle=False, drop_last=True, **loader_args)
 
@@ -74,8 +103,8 @@ def train_model(
     ''')
 
     # 4. Set up the optimizer, the loss, the learning rate scheduler and the loss scaling for AMP
-    optimizer = optim.RMSprop(model.parameters(),
-                              lr=learning_rate, weight_decay=weight_decay, momentum=momentum, foreach=True)
+    # Use Adam for faster short-run convergence when sacrificing some long-term tuning
+    optimizer = optim.Adam(model.parameters(), lr=learning_rate, weight_decay=weight_decay)
     scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, 'max', patience=5)  # goal: maximize Dice score
     grad_scaler = torch.cuda.amp.GradScaler(enabled=amp)
     criterion = nn.CrossEntropyLoss() if model.n_classes > 1 else nn.BCEWithLogitsLoss()
@@ -127,8 +156,8 @@ def train_model(
                 })
                 pbar.set_postfix(**{'loss (batch)': loss.item()})
 
-                # Evaluation round
-                division_step = (n_train // (5 * batch_size))
+                # Evaluation round (reduce frequency during fast runs to save time)
+                division_step = (n_train // (20 * batch_size))
                 if division_step > 0:
                     if global_step % division_step == 0:
                         histograms = {}
@@ -180,6 +209,16 @@ def get_args():
     parser.add_argument('--amp', action='store_true', default=True, help='Use mixed precision')
     parser.add_argument('--bilinear', action='store_true', default=False, help='Use bilinear upsampling')
     parser.add_argument('--classes', '-c', type=int, default=2, help='Number of classes')
+    parser.add_argument('--base-channels', type=int, default=16,
+                        help='Base channels for UNet (smaller -> faster, e.g. 16)')
+    parser.add_argument('--fast', action='store_true', default=False,
+                        help='Enable aggressive fast mode (overrides several args for speed)')
+    parser.add_argument('--tiny', action='store_true', default=False,
+                        help='Enable tiny mode (very small model + tiny inputs)')
+    parser.add_argument('--subset', type=float, default=1.0,
+                        help='Fraction of dataset to use (0-1) for fast experiments')
+    parser.add_argument('--gray', action='store_true', default=False,
+                        help='Convert input images to grayscale (1 channel)')
 
     return parser.parse_args()
 
@@ -194,7 +233,28 @@ if __name__ == '__main__':
     # Change here to adapt to your data
     # n_channels=3 for RGB images
     # n_classes is the number of probabilities you want to get per pixel
-    model = UNet(n_channels=3, n_classes=args.classes, bilinear=args.bilinear)
+    # If user requested fast mode, override some args for aggressive speed
+    if args.fast:
+        # be conservative: prefer smaller scale and moderate batch size for RTX4060
+        args.batch_size = max(1, args.batch_size)
+        # force small model and small input by default in fast mode
+        args.scale = 0.125
+        args.amp = True
+        args.bilinear = True
+        # disable WANDB network logging for speed
+        os.environ['WANDB_MODE'] = 'offline'
+
+    # Tiny mode: very aggressive speed / tiny model
+    if args.tiny:
+        args.base_channels = min(8, args.base_channels)
+        args.scale = min(args.scale, 0.0625)
+        # keep amp enabled for speed and memory
+        args.amp = True
+        os.environ['WANDB_MODE'] = 'offline'
+
+    # Automatically set input channels to 1 when using --gray, otherwise default to 3
+    n_channels = 1 if args.gray else 3
+    model = UNet(n_channels=n_channels, n_classes=args.classes, bilinear=args.bilinear, base_c=args.base_channels)
     model = model.to(memory_format=torch.channels_last)
 
     logging.info(f'Network:\n'
@@ -218,7 +278,9 @@ if __name__ == '__main__':
             device=device,
             img_scale=args.scale,
             val_percent=args.val / 100,
-            amp=args.amp
+            amp=args.amp,
+            subset=args.subset,
+            gray=args.gray
         )
     except torch.cuda.OutOfMemoryError:
         logging.error('Detected OutOfMemoryError! '
